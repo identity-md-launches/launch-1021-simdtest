@@ -168,8 +168,8 @@ contract SIMDTESTHook is IUnlockCallback {
     }
 
     /// @notice Geometric time-weighted reference, expressed as sqrt(currency1/currency0) Q96.
-    /// @dev Average tick since initialization or the last eligible batch attempt. A batch must
-    ///      wait at least an hour, including after a zero fill. Same-timestamp changes have no weight.
+    /// @dev Average liquid tick since initialization or the last batch that spent IMD. Such batches
+    ///      are at least an hour apart. Empty attempts preserve history; same-timestamp changes have no weight.
     function referencePrice() public view returns (uint160) {
         if (!initialized) return 0;
         uint256 elapsed = block.timestamp - epochStart;
@@ -198,20 +198,31 @@ contract SIMDTESTHook is IUnlockCallback {
         if (block.timestamp - lastBatch < BATCH_INTERVAL) revert BatchTooSoon();
         uint160 referenceX96 = referencePrice();
         uint160 limitX96 = _priceLimit(referenceX96);
+        (uint160 spot,,,) = poolManager.getSlot0(poolId);
+        // Tighten against current executable price as well as the TWAP. Empty-region spot can
+        // move for free; use the retained liquid observation there so launch liquidity is reachable.
+        uint160 spotLimitX96 = _priceLimit(
+            poolManager.getLiquidity(poolId) != 0 ? spot : TickMath.getSqrtPriceAtTick(observedTick)
+        );
+        if (pairedIsCurrency0 ? spotLimitX96 > limitX96 : spotLimitX96 < limitX96) {
+            limitX96 = spotLimitX96;
+        }
         uint256 budget = pending() / 4;
         // Core represents each currency delta as int128. Limit exceptionally large donations.
         if (budget > uint256(uint128(type(int128).max))) budget = uint256(uint128(type(int128).max));
-        lastBatch = block.timestamp;
-        (uint160 spot,,,) = poolManager.getSlot0(poolId);
         bool room = pairedIsCurrency0 ? spot > limitX96 : spot < limitX96;
         if (budget != 0 && room) {
             (spent, burned) = abi.decode(poolManager.unlock(abi.encode(budget, limitX96)), (uint256, uint256));
         }
-        // Core suppresses self-swap callbacks. Start a fresh epoch at the POST-batch tick.
-        (, observedTick,,) = poolManager.getSlot0(poolId);
-        cumulativeTick = 0;
-        observedAt = block.timestamp;
-        epochStart = block.timestamp;
+        // Empty attempts neither consume the hourly slot nor erase the TWAP's history.
+        // Core suppresses self-swap callbacks; record a filled batch's liquid post-swap tick.
+        if (spent != 0) {
+            lastBatch = block.timestamp;
+            if (poolManager.getLiquidity(poolId) != 0) (, observedTick,,) = poolManager.getSlot0(poolId);
+            cumulativeTick = 0;
+            observedAt = block.timestamp;
+            epochStart = block.timestamp;
+        }
         emit BatchExecuted(budget, spent, burned, referenceX96, limitX96);
     }
 
@@ -245,7 +256,9 @@ contract SIMDTESTHook is IUnlockCallback {
     function _observe() private {
         cumulativeTick += int256(observedTick) * int256(block.timestamp - observedAt);
         observedAt = block.timestamp;
-        (, observedTick,,) = poolManager.getSlot0(poolId);
+        // Core can traverse empty liquidity to any price limit, even on a zero fill.
+        // Carry the last liquid (or initialization) tick forward instead of weighting that void.
+        if (poolManager.getLiquidity(poolId) != 0) (, observedTick,,) = poolManager.getSlot0(poolId);
     }
 
     function _claims(address currency) private view returns (uint256) {

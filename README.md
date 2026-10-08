@@ -23,7 +23,7 @@ token sweeps and hourly bounded IMD buybacks. `launch.json` names the hook itsel
 | Static LP fee / tick spacing | `12500` / `60` |
 | Hook fee | `100` bps, rounded down to whole minor units |
 | Batch interval / maximum budget | `3600` seconds / floor(accrued IMD / 4) |
-| Batch price tolerance | `300` bps in pool price |
+| Batch price tolerance | `300` bps in pool price, bounded by both epoch TWAP and current liquid spot |
 | Required address mask | `address(hook) & 0x3fff == 0x20c4` |
 
 Constructor: `SIMDTESTHook(IPoolManager manager, address token)`. The manifest
@@ -35,6 +35,8 @@ static fee and tick spacing. Initialization is permissionless through the
 PoolManager and allowed only once. The factory must deploy and initialize
 atomically at its economically chosen opening price. The manifest's
 `79228162514264337593543950336` is provenance, not a price enforced by the hook.
+There is no factory-sender allowlist: splitting deployment and initialization
+into separate transactions lets the first caller choose the opening price.
 
 Mine CREATE2 using the **actual factory that performs CREATE2**, its salt
 convention, final bytecode, actual manager, and the factory's predicted token
@@ -95,16 +97,21 @@ the dead address's inaccessible balance.
 
 Anyone can call `executeBatch()` in a separate PoolManager unlock. The first
 call must wait one hour from pool initialization; subsequent calls must wait
-one hour from the previous eligible attempt. Nested calls from a swap or another
+one hour from the previous batch that spent IMD. Empty attempts leave the hourly
+slot available for a retry. Nested calls from a swap or another
 manager unlock are refused. A keeper should submit these as separate transactions.
 No rewards or automation service are built in.
 
 The reference definition, where the brief leaves its window unspecified, is an
 **epoch geometric TWAP**: time-weighted mean pool tick since initialization or
-the previous eligible batch attempt. All epochs used for a batch last at least
+the previous batch that spent IMD. All epochs used for a batch last at least
 3600 seconds. Every external swap adds `previousTick * elapsedSeconds` before
-recording its new tick. `referencePrice()` also includes idle time at the last
-tick and returns `TickMath.getSqrtPriceAtTick(floor(meanTick))` in Q64.96. At the
+recording its new tick **only if the pool has active liquidity**. In an empty
+region, core can move spot to a caller's limit without trading; the hook carries
+the last liquid observation (or initialization tick) forward instead. This also
+applies when a nonzero fill exhausts liquidity and then traverses an empty region.
+`referencePrice()` includes idle time at the retained tick and returns
+`TickMath.getSqrtPriceAtTick(floor(meanTick))` in Q64.96. At the
 start of an epoch it returns that epoch's opening tick price. A swap at the same
 timestamp has zero historical weight. If keepers are absent, the epoch is longer
 than one hour; this is not a rolling one-hour oracle.
@@ -115,7 +122,13 @@ For an IMD-to-SIMDTEST batch:
    Very large donations are additionally capped at `int128.max` per batch to
    respect the manager's delta representation.
 2. Set the square-root price limit to reference times `sqrt(0.97)` when IMD is
-   currency0, or reference times `sqrt(1.03)` when IMD is currency1. Integer
+   currency0, or reference times `sqrt(1.03)` when IMD is currency1. Tighten it
+   against the same bound computed from the pre-batch spot: use the higher limit
+   for currency0 input and the lower limit for currency1 input. If spot has no
+   active liquidity, use the last liquid observation (initialization tick before
+   the first trade) for this additional bound. An untraded empty-region spot
+   must not prevent the buyback from reaching the one-sided launch liquidity.
+   The TWAP bound always applies. Integer
    rounding tightens the limit; global TickMath boundaries are respected. The
    tolerance is in `currency1/currency0` price, not a 3% change in sqrt price or
    an all-in execution quote including LP fees.
@@ -125,15 +138,21 @@ For an IMD-to-SIMDTEST batch:
 4. Settle only actual IMD spent, burning the hook's IMD claims first and paying
    from direct IMD donations only when needed. Send bought tokens directly from
    PoolManager to the dead address. Unfilled budget stays pending.
-5. Record the post-batch tick and start a new epoch. Zero-budget, zero-liquidity
-   and out-of-limit attempts also start a new epoch and consume the hourly slot.
-   This lets the reference adapt instead of repeatedly reverting at an obsolete
-   price. There is no minimum-output condition or hardcoded LP-fee output estimate.
+5. If IMD was spent, advance `lastBatch` and start a new epoch using the post-batch
+   tick when it has active liquidity, otherwise the retained observation.
+   Zero-spend attempts preserve both the hourly slot and the accumulated TWAP
+   history. Resetting history on an empty attempt would let repeated calls erase
+   the time-weighted guard. A later retry can fill once spot is inside the band;
+   persistent liquid prices also gain weight as time passes. No minimum-output
+   condition or hardcoded LP-fee output estimate is used.
 
 `lastBatch()` starts at the initialization timestamp. `BatchExecuted` records
 budget, actual spend, amount burned, the reference used, and its price limit;
 `FeeAccrued` and `Swept` record fees and sweeps. After a batch, `referencePrice()`
 is the new epoch reference; use the event to inspect the reference just used.
+In a quiet liquid pool, each filled batch's own price impact becomes the next
+epoch's reference. Successive hourly bands can therefore compound; the 300 bps
+limit is per batch, not a lifetime cap relative to the launch price.
 
 ## Build and checks
 
@@ -160,6 +179,10 @@ overflow-domain rejection, cooldown boundaries, idle and manipulated prices,
 partial/zero batch fills, fee-free self-swaps, burn accounting, fresh token-only
 liquidity, code limits and forbidden opcodes. The stateful conservation invariant
 interleaves trades, time advances, batches and sweeps with failure on reverts.
+`test/BatchRegression.t.sol` reproduces empty-region oracle poisoning, stale-TWAP
+sandwiches and empty-attempt cooldown grief in both currency orderings. It checks
+the repairs, fuzzes drift timing and size, and records the retained initialization,
+fee rounding, tick rounding and quiet-pool epoch behavior.
 
 The mainnet suite uses the same scenarios against the **deployed mainnet manager
 and actual IMD code**. Test balances are funded with a Foundry balance cheatcode;
@@ -192,18 +215,23 @@ another purpose. The factory supplies the pool's initial economics, deployment,
 liquidity and supply distribution.
 
 The epoch TWAP removes same-timestamp spot manipulation from the reference but
-does not prevent sustained manipulation of a thin pool. The fixed price band
-and 25% budget bound execution, not economic loss relative to an external market.
-Tick rounding introduces less than one tick of reference precision loss. Delayed
-keepers mean a longer and potentially stale first reference; an out-of-limit
-attempt advances the epoch without spending. Review liquidity and keeper behavior
-as part of launch economics.
+does not prevent sustained manipulation of a thin pool. The additional spot bound
+limits the batch's own impact after intra-epoch drift; it is not an independent
+oracle or a general guarantee against MEV. The fixed price band and 25% budget
+bound execution, not economic loss relative to an external market. Mean-tick
+flooring loses less than one tick, and core's boundary convention can put its tick
+one below the price tick. Together they can widen the TWAP-side band by about two
+basis points for IMD as currency0 (and tighten it for currency1); the liquid-spot
+bound uses the actual sqrt price. Delayed keepers mean a longer, potentially stale
+reference; empty attempts preserve its history. Fee flooring undercharges by less
+than one minor unit per swap and fills below 100 minor units pay zero. Review
+liquidity and keeper behavior as part of launch economics.
 
 Local review covered callback and unlock authorization, self-swap exemption,
 claim/delta conservation, partial-fill settlement, immutability, oracle sampling,
 price-limit rounding, and deployment bits. The launch token and hook runtime
 contain no SELFDESTRUCT, DELEGATECALL or CALLCODE. Hook creation code with its two
 constructor arguments is below EIP-3860, and runtime is below EIP-170. No
-independent security audit, Slither/Mythril run, deployment or live transaction
-was performed. Independent adversarial review and the fork rehearsal remain
-release responsibilities.
+Slither/Mythril run, deployment or live transaction was performed. This revision
+answers the supplied independent review in `.imd-responses.json`; independent
+review of the repairs and the fork rehearsal remain release responsibilities.

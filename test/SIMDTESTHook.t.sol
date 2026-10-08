@@ -175,7 +175,14 @@ abstract contract HookScenarios is LaunchFixture {
         vm.warp(initializedAt + 3600);
         (uint256 spent, uint256 burned) = hook.executeBatch();
         assertEq(spent + burned, 0);
-        assertEq(hook.lastBatch(), initializedAt + 3600);
+        assertEq(hook.lastBatch(), initializedAt);
+        assertEq(hook.epochStart(), initializedAt);
+        hook.executeBatch();
+        IERC20(IMD).transfer(address(hook), 1000 ether);
+        (spent, burned) = hook.executeBatch();
+        assertEq(spent, 250 ether);
+        assertGt(burned, 0);
+        assertEq(hook.lastBatch(), block.timestamp);
         vm.expectRevert(SIMDTESTHook.BatchTooSoon.selector);
         hook.executeBatch();
     }
