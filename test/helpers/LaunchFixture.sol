@@ -37,6 +37,12 @@ abstract contract LaunchFixture is Test {
     bool internal buyDirection;
 
     function _setup(bool forked, bool tokenHigh, bool seed) internal {
+        _deploy(forked, tokenHigh);
+        manager.initialize(key, Q96);
+        if (seed) actor.liquidity(key, -600, 600, 10_000_000 ether);
+    }
+
+    function _deploy(bool forked, bool tokenHigh) internal {
         if (forked) {
             assertEq(block.chainid, 1);
             assertGt(MAINNET_MANAGER.code.length, 0, "fork lacks mainnet manager");
@@ -69,8 +75,6 @@ abstract contract LaunchFixture is Test {
         actor = new PoolActor(manager);
         token.approve(address(actor), type(uint256).max);
         IERC20(IMD).approve(address(actor), type(uint256).max);
-        manager.initialize(key, Q96);
-        if (seed) actor.liquidity(key, -600, 600, 10_000_000 ether);
     }
 
     function _swap(bool buy, bool exactInput, uint256 amount, uint160 limit) internal returns (BalanceDelta) {
