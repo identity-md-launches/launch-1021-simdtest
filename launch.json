@@ -1,0 +1,16 @@
+{
+  "kind": "univ4_hook",
+  "token": {"contract": "SIMDTEST", "name": "SIMDTEST", "symbol": "SIMDTEST", "decimals": 18},
+  "hook": {
+    "contract": "SIMDTESTHook",
+    "constructorArgs": ["$poolManager", "$token"],
+    "permissions": ["beforeInitialize", "beforeSwap", "afterSwap", "afterSwapReturnDelta"]
+  },
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "Ethereum mainnet, chainId 1. Constructor(IPoolManager poolManager, address token), resolved by the launch factory. Deploy SIMDTESTHook directly with CREATE2; address & 0x3fff must equal 0x20c4. Static LP fee 12500 (1.25%) plus a 100 bps hook fee on actual unspecified-currency fill, collected as hook-owned ERC-6909 claims. No LP override. Anyone may sweep token claims to the dead address or execute a buyback each 3600 seconds using at most 25% of IMD holdings, with a 300 bps pool-price limit from the epoch TWAP. Initial price is provenance only; the factory sets launch economics and distributes the full 1e27-unit supply. No owner or post-launch settings."
+}
