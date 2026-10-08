@@ -254,16 +254,34 @@ abstract contract AdversarialHookScenarios is LaunchFixture {
     function test_SubFourWeiBudgetStaysAccruedAndDoesNotBlockSweeping() public {
         IERC20(IMD).transfer(address(hook), 3);
         token.transfer(address(hook), 1);
+        uint256 last = hook.lastBatch();
+        uint256 epoch = hook.epochStart();
         vm.warp(vm.getBlockTimestamp() + 3600);
+        uint160 referenceBefore = hook.referencePrice();
         (uint256 spent, uint256 burned) = hook.executeBatch();
         assertEq(spent, 0);
         assertEq(burned, 0);
         assertEq(hook.pending(), 3);
-        assertEq(hook.lastBatch(), vm.getBlockTimestamp());
+        assertEq(hook.lastBatch(), last, "dust attempt consumed the hourly slot");
+        assertEq(hook.epochStart(), epoch);
+        assertEq(hook.referencePrice(), referenceBefore);
         assertEq(hook.sweep(), 1);
+        (spent, burned) = hook.executeBatch();
+        assertEq(spent + burned, 0);
+        assertEq(hook.pending(), 3);
+        assertEq(hook.lastBatch(), last);
+        assertEq(hook.epochStart(), epoch);
+        assertEq(hook.referencePrice(), referenceBefore);
+        // Adding usable funds must allow a filled batch in the same timestamp.
+        IERC20(IMD).transfer(address(hook), 1000 ether);
+        (spent, burned) = hook.executeBatch();
+        assertEq(spent, uint256(1000 ether + 3) / 4);
+        assertGt(burned, 0);
+        assertEq(hook.pending(), 1000 ether + 3 - spent);
+        assertEq(hook.lastBatch(), vm.getBlockTimestamp());
         vm.expectRevert(SIMDTESTHook.BatchTooSoon.selector);
         hook.executeBatch();
-        assertEq(token.balanceOf(DEAD), 1);
+        assertEq(token.balanceOf(DEAD), 1 + burned);
         _assertSettled();
     }
 }

@@ -124,14 +124,17 @@ contract LaunchHandler is Test {
         uint256 available = hook.pending();
         uint256 tokenFeesBefore = hook.pendingBurn();
         uint256 deadBefore = IERC20(hook.token()).balanceOf(hook.BURN());
+        uint256 epoch = hook.epochStart();
+        uint160 referenceBefore = hook.referencePrice();
         vm.recordLogs();
         (uint256 spentNow, uint256 boughtNow) = hook.executeBatch();
         require(spentNow <= available / 4, "budget exceeded");
-        assertEq(hook.lastBatch(), vm.getBlockTimestamp());
         assertEq(hook.pending(), available - spentNow);
         assertEq(hook.pendingBurn(), tokenFeesBefore, "batch charged a hook fee");
         assertEq(IERC20(hook.token()).balanceOf(hook.BURN()), deadBefore + boughtNow);
         if (spentNow != 0) {
+            assertEq(hook.lastBatch(), vm.getBlockTimestamp());
+            assertEq(hook.epochStart(), vm.getBlockTimestamp());
             SwapEvidence.Receipt memory receipt =
                 SwapEvidence.read(vm.getRecordedLogs(), address(manager), key.toId());
             bool buy = hook.pairedIsCurrency0();
@@ -139,6 +142,11 @@ contract LaunchHandler is Test {
             assertEq(receipt.lpFee, 12500);
             assertEq(spentNow, uint256(-int256(buy ? receipt.delta.amount0() : receipt.delta.amount1())));
             assertEq(boughtNow, uint256(int256(buy ? receipt.delta.amount1() : receipt.delta.amount0())));
+        } else {
+            assertEq(boughtNow, 0);
+            assertEq(hook.lastBatch(), last, "empty attempt consumed the hourly slot");
+            assertEq(hook.epochStart(), epoch, "empty attempt reset the TWAP epoch");
+            assertEq(hook.referencePrice(), referenceBefore, "empty attempt changed the reference");
         }
         spent += spentNow;
         bought += boughtNow;
@@ -179,6 +187,37 @@ abstract contract ConservationInvariantScenarios is LaunchFixture {
     }
 
     function tokenHigh() internal pure virtual returns (bool);
+
+    function test_HandlerEmptyAndDustAttemptsRetainHistoryUntilFundedRetry() public {
+        handler.elapse(1800);
+        handler.limitedTrade(buyDirection, true, 10);
+        handler.elapse(1800);
+        uint160 referenceBefore = hook.referencePrice();
+        assertTrue(referenceBefore != Q96, "sequence must build nontrivial price history");
+        assertEq(hook.pending(), 0);
+        uint256 last = hook.lastBatch();
+        uint256 epoch = hook.epochStart();
+        handler.batch();
+        handler.donate(true, false, 3);
+        handler.batch();
+        assertEq(handler.spent(), 0);
+        assertEq(hook.pending(), 3);
+        assertEq(hook.lastBatch(), last);
+        assertEq(hook.epochStart(), epoch);
+        assertEq(hook.referencePrice(), referenceBefore);
+        invariant_AllFeeAssetsAreAccountedFor();
+
+        handler.sweep();
+        handler.donate(true, true, 1000 ether);
+        handler.batch();
+        assertEq(handler.spent(), 250 ether);
+        assertGt(handler.bought(), 0);
+        assertEq(hook.pending(), 750 ether + 3);
+        assertEq(hook.lastBatch(), vm.getBlockTimestamp());
+        handler.batch(); // The handler requires BatchTooSoon after a filled batch.
+        assertEq(handler.spent(), 250 ether);
+        invariant_AllFeeAssetsAreAccountedFor();
+    }
 
     function invariant_AllFeeAssetsAreAccountedFor() public view {
         assertEq(hook.pending() + handler.spent(), handler.pairedFees() + handler.pairedDonations());

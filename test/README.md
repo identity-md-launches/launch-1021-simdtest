@@ -7,6 +7,7 @@ The existing launch tests remain in place. The additional coverage exercises:
 - Atomic rollback when router settlement, direct token sweeping, or mixed claim/direct IMD batch settlement fails. Each failure is followed by a successful retry.
 - Permissionless burning of donated ERC-6909 claims, refusal of unauthorized claim transfers, and refusal of both keeper functions inside another manager unlock.
 - Batch settlement using both claims and direct IMD, partial fills funded entirely by claims, and reuse of unspent claims after the cooldown. Squared pool prices independently check the 300 bps limit.
+- Empty and dust batch attempts preserve the hourly slot, TWAP epoch, and reference. The handler distinguishes these attempts from batches that spend IMD. A deterministic replay builds nonzero price history, retries after funding in the same timestamp, and checks conservation and the filled batch's cooldown in both currency orderings.
 
 `SwapEvidence` reads the real PoolManager's pre-hook `Swap` event. The handler computes expected fees from that receipt rather than from the hook's fee event or balance changes. It mixes ordinary trades, price-limited trades, direct and fully backed claim donations, time advances, batches, and sweeps. For each currency ordering it runs 256 sequences of 64 calls with unexpected reverts treated as failures. Assertions cover fee conservation, claim backing, the entire fixed token supply, IMD conservation, batch budget/cooldown, dead-address receipts, and settled manager deltas.
 
@@ -32,4 +33,4 @@ FOUNDRY_OUT=test/scratch/out FOUNDRY_CACHE_PATH=test/scratch/cache \
   --fork-block-number 26146258 --no-storage-caching --summary
 ```
 
-Validation: `forge build` succeeded; the offline suite passed 68 tests with two explicit fork setup skips; the fork run passed 56 tests without skips. Each fuzz property ran 1,000 cases. Both invariant suites completed 16,384 calls without unexpected reverts. No reproducible implementation defect was identified by these tests.
+Revision validation: `forge build` succeeded; the offline suite passed 102 tests with two explicit fork setup skips; the fork run passed 56 tests without skips at the block above. Each fuzz property ran 1,000 cases. Both invariant suites completed 16,384 calls without unexpected reverts. The baseline's four failures came from stale assertions that empty attempts advance the cooldown; the assertions now preserve the revised hook's empty-attempt behavior and still enforce the cooldown after spending. No new implementation defect was identified during this revision.
